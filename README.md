@@ -87,6 +87,14 @@ incremental). Note that `--repos` is repeated per repo:
 | `0` | Success. |
 | `1` | One or more files failed to sync or verify. |
 | `2` | Another run already holds the lock (only without `--wait-for-lock`). |
+| `130` | Interrupted with Ctrl-C. |
+
+### Interrupting
+
+Ctrl-C stops all download threads. Queued downloads are cancelled, and running
+ones stop and remove their `.part` file. Any thread still stuck waiting on the
+network after 5 seconds is killed by exiting the process. Press Ctrl-C a second
+time to skip the wait.
 
 ### Running from cron
 
