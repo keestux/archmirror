@@ -1,0 +1,15 @@
+[project]
+name = "archmirror"
+version = "1.0.0"
+description = "Create and keep in sync a local copy of an Arch Linux package mirror over HTTP(S)."
+readme = "README.md"
+authors = [
+    { name = "Kees Bakker", email = "kees@ijzerbout.nl" },
+]
+requires-python = ">=3.11"
+# Keep in sync with the inline script metadata (PEP 723) in archmirror.py.
+dependencies = [
+    "click",
+    "requests",
+    "zstandard",
+]
