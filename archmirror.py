@@ -55,7 +55,13 @@ What it does
 
 Exit codes: 0 = success, 1 = one or more files failed to sync/verify,
 2 = another run already held the lock (only possible without
---wait-for-lock).
+--wait-for-lock), 130 = interrupted with Ctrl-C.
+
+Interrupting (Ctrl-C) stops all download threads: queued downloads are
+cancelled, running ones notice within one chunk and remove their `.part`
+file, and any thread still blocked in network I/O after a short grace
+period is killed by exiting the process. A second Ctrl-C skips the grace
+period.
 
 Requirements
 ------------
@@ -122,9 +128,11 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from pathlib import Path
+from typing import NoReturn
 from urllib.parse import urljoin, unquote, quote
 
 import click
@@ -146,6 +154,26 @@ DEFAULT_ARCH = "x86_64"
 HREF_RE = re.compile(r'href="([^"]+)"', re.IGNORECASE)
 
 USER_AGENT = "archmirror.py/1.0 (+python-requests)"
+
+# Seconds to let running download threads wind down after Ctrl-C before
+# the process is force-exited (killing any thread still blocked in I/O).
+SHUTDOWN_GRACE = 5.0
+
+# Set on Ctrl-C; worker threads poll it and bail out via SyncCancelled.
+_stop = threading.Event()
+
+# .part files currently being written, so _abort() can remove the ones
+# belonging to threads it has to kill.
+_active_parts: set[Path] = set()
+
+
+class SyncCancelled(Exception):
+    """Raised inside a worker thread when the run is being interrupted."""
+
+
+def _check_stop() -> None:
+    if _stop.is_set():
+        raise SyncCancelled()
 
 
 class Stats:
@@ -337,6 +365,7 @@ def compute_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as fh:
         for chunk in iter(lambda: fh.read(chunk_size), b""):
+            _check_stop()
             digest.update(chunk)
     return digest.hexdigest()
 
@@ -350,6 +379,7 @@ def sync_file(
     stats: Stats,
     expected_sha256: str | None = None,
 ) -> None:
+    _check_stop()
     stats.checked += 1
     try:
         head = session.head(remote_url, timeout=timeout, allow_redirects=True)
@@ -358,6 +388,7 @@ def sync_file(
         LOG.error("HEAD failed for %s: %s", remote_url, exc)
         stats.errors += 1
         return
+    _check_stop()
 
     remote_size = None
     if "Content-Length" in head.headers:
@@ -393,12 +424,14 @@ def sync_file(
     local_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = local_path.with_suffix(local_path.suffix + ".part")
 
+    _active_parts.add(tmp_path)
     try:
         with session.get(remote_url, stream=True, timeout=timeout) as resp:
             resp.raise_for_status()
             written = 0
             with open(tmp_path, "wb") as fh:
                 for chunk in resp.iter_content(chunk_size=1024 * 256):
+                    _check_stop()
                     if chunk:
                         fh.write(chunk)
                         written += len(chunk)
@@ -427,6 +460,11 @@ def sync_file(
         stats.errors += 1
         if tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
+    except SyncCancelled:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    finally:
+        _active_parts.discard(tmp_path)
 
 
 def sync_directory(
@@ -539,6 +577,33 @@ def acquire_lock(lock_path: Path, wait: bool):
             fh.close()
 
 
+def _abort(executor: ThreadPoolExecutor, futures: list) -> NoReturn:
+    """Stop all download threads after Ctrl-C and exit with status 130.
+
+    Threads can't be killed from outside in Python, so: signal them via
+    _stop (they check it between chunks and remove their .part file),
+    cancel everything still queued, and give running threads
+    SHUTDOWN_GRACE seconds to finish. Any thread still blocked in network
+    I/O after that is killed by force-exiting the process (os._exit), which
+    also releases the flock. A second Ctrl-C skips the grace period."""
+    _stop.set()
+    executor.shutdown(wait=False, cancel_futures=True)
+    running = [f for f in futures if not f.done()]
+    LOG.warning("interrupted - stopping %d running download thread(s)", len(running))
+    try:
+        wait(running, timeout=SHUTDOWN_GRACE)
+    except KeyboardInterrupt:
+        pass
+    stuck = [f for f in running if not f.done()]
+    if stuck:
+        LOG.warning("killing %d thread(s) still blocked in network I/O", len(stuck))
+        for tmp_path in list(_active_parts):
+            tmp_path.unlink(missing_ok=True)
+        logging.shutdown()
+        os._exit(130)
+    sys.exit(130)
+
+
 def _rmtree(path: Path) -> None:
     for child in path.iterdir():
         if child.is_dir():
@@ -613,6 +678,10 @@ def main(
             "(pass --wait-for-lock to wait instead)", lock_path,
         )
         sys.exit(2)
+    except KeyboardInterrupt:
+        # Interrupted outside the download phase (e.g. waiting for the lock).
+        LOG.warning("interrupted")
+        sys.exit(130)
 
 
 def _run_sync(
@@ -640,8 +709,11 @@ def _run_sync(
     if include_iso:
         targets.append(("iso", None))
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures: list = []
+    # Not a `with` block: its implicit shutdown(wait=True) would block on
+    # Ctrl-C until every queued download had finished.
+    executor = ThreadPoolExecutor(max_workers=workers)
+    futures: list = []
+    try:
         for rel_path, repo_name in targets:
             remote_url = urljoin(source.rstrip("/") + "/", rel_path + "/")
             local_dir = dest_root / rel_path
@@ -658,6 +730,9 @@ def _run_sync(
             )
         for fut in as_completed(futures):
             fut.result()  # re-raise unexpected exceptions, if any
+    except KeyboardInterrupt:
+        _abort(executor, futures)
+    executor.shutdown(wait=True)
 
     elapsed = time.time() - start
     LOG.info("done in %.1fs - %s", elapsed, stats.summary())
